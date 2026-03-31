@@ -1,0 +1,43 @@
+{
+  "model": "cc-opus",
+  "system": [
+    {
+      "type": "text",
+      "text": "x-anthropic-billing-header: transient\nBase system text"
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nSessionStart hook additional context\ncwd=/workspace"
+        },
+        {
+          "type": "text",
+          "text": "Reply with exactly OK."
+        }
+      ]
+    }
+  ],
+  "max_tokens": 32,
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 2048
+  },
+  "output_config": {
+    "effort": "xhigh"
+  },
+  "metadata": {
+    "user_id": "{\"device_id\":\"device-fixed-123\",\"account_uuid\":\"\",\"session_id\":\"session-abc\"}"
+  },
+  "context_management": {
+    "edits": [
+      {
+        "type": "clear_thinking_20251015",
+        "keep": "all"
+      }
+    ]
+  }
+}

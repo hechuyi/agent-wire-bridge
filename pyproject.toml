@@ -1,0 +1,13 @@
+[project]
+name = "agent-wire-bridge"
+version = "0.1.0"
+description = "Reproducible Anthropic-to-Responses bridge overlay for LiteLLM."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "litellm[proxy]==1.82.6",
+]
+
+[tool.setuptools]
+py-modules = []
