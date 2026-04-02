@@ -60,23 +60,23 @@
              if response_obj is not None:
 --- a/litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py
 +++ b/litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py
-@@ -5,8 +5,9 @@
+@@ -5,8 +5,11 @@
  path used for OpenAI and Azure models.
  """
  
 +import hashlib
  import json
 -from typing import Any, Dict, List, Optional, Union, cast
++import re
++import uuid
 +from typing import Any, Dict, List, Optional, Tuple, Union, cast
  
  from litellm.llms.anthropic.experimental_pass_through.utils import (
      is_reasoning_auto_summary_enabled,
-@@ -49,8 +50,230 @@
-             return f"data:{media_type};base64,{data}" if data else None
-         elif source_type == "url":
+@@ -51,6 +54,600 @@
              return source.get("url")
-+        return None
-+
+         return None
+ 
 +    @staticmethod
 +    def _sanitize_system_text(text: str) -> Optional[str]:
 +        """Remove volatile Anthropic billing headers from system text."""
@@ -89,7 +89,259 @@
 +        return text
 +
 +    @staticmethod
-+    def _extract_system_reminder_text(text: str) -> Optional[str]:
++    def _is_probably_volatile_reminder_line(text: str) -> bool:
++        lowered = text.strip().lower()
++        if not lowered:
++            return False
++        for prefix in (
++            "session_id=",
++            "session=",
++            "request_id=",
++            "request=",
++            "trace_id=",
++            "traceparent=",
++            "run_id=",
++            "invocation_id=",
++            "timestamp=",
++        ):
++            if lowered.startswith(prefix):
++                return True
++        return False
++
++    @classmethod
++    def _normalize_unordered_bullet_runs(cls, lines: List[str]) -> List[str]:
++        normalized: List[str] = []
++        bullet_run: List[str] = []
++
++        def flush_bullet_run() -> None:
++            if bullet_run:
++                normalized.extend(sorted(bullet_run))
++                bullet_run.clear()
++
++        for line in lines:
++            if line.lstrip().startswith("- "):
++                bullet_run.append(line.rstrip())
++                continue
++            flush_bullet_run()
++            normalized.append(line.rstrip())
++
++        flush_bullet_run()
++        return normalized
++
++    @staticmethod
++    def _collapse_blank_lines(lines: List[str]) -> List[str]:
++        collapsed: List[str] = []
++        previous_blank = True
++
++        for raw_line in lines:
++            line = raw_line.rstrip()
++            is_blank = not line.strip()
++            if is_blank:
++                if previous_blank:
++                    continue
++                collapsed.append("")
++            else:
++                collapsed.append(line)
++            previous_blank = is_blank
++
++        while collapsed and not collapsed[0].strip():
++            collapsed.pop(0)
++        while collapsed and not collapsed[-1].strip():
++            collapsed.pop()
++
++        return collapsed
++
++    @staticmethod
++    def _unique_preserve_order(values: List[str]) -> List[str]:
++        seen = set()
++        result: List[str] = []
++        for value in values:
++            if not value or value in seen:
++                continue
++            seen.add(value)
++            result.append(value)
++        return result
++
++    @staticmethod
++    def _clean_markdown_line(text: str) -> str:
++        cleaned = text.strip()
++        cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
++        cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
++        cleaned = cleaned.replace("`", "")
++        cleaned = re.sub(r"\s+", " ", cleaned)
++        return cleaned.strip()
++
++    @classmethod
++    def _summarize_skill_block(
++        cls, skill_name: str, lines: List[str]
++    ) -> Optional[str]:
++        candidate: Optional[str] = None
++        core_principle: Optional[str] = None
++
++        for raw_line in lines:
++            stripped = raw_line.strip()
++            if not stripped:
++                continue
++            if stripped.startswith(("Path:", "Base directory", "```", "|", "<")):
++                continue
++            if stripped.startswith(("#", "##", "###")):
++                continue
++            if stripped.startswith(("digraph ", "subgraph ", "\"", "}")):
++                continue
++            if stripped.startswith("- "):
++                continue
++
++            cleaned = cls._clean_markdown_line(stripped)
++            if not cleaned:
++                continue
++
++            if cleaned.lower().startswith("core principle:"):
++                core_principle = cleaned
++                continue
++            if cleaned.lower().startswith("why "):
++                continue
++
++            candidate = cleaned
++            break
++
++        summary = candidate or core_principle
++        if summary is None:
++            return None
++        return f"{skill_name}: {summary}"
++
++    @classmethod
++    def _consume_context_block(
++        cls, lines: List[str], start_index: int
++    ) -> Tuple[int, List[str], List[str], Optional[str]]:
++        context_lines: List[str] = []
++        memory_bullets: List[str] = []
++        current_date: Optional[str] = None
++        section: Optional[str] = None
++        index = start_index
++
++        while index < len(lines):
++            stripped = lines[index].strip()
++
++            if stripped.startswith("### Skill: "):
++                break
++            if stripped in {"<system-reminder>", "</system-reminder>"}:
++                index += 1
++                continue
++            if stripped == "# claudeMd":
++                section = "claude_md"
++                index += 1
++                continue
++            if stripped == "# currentDate":
++                section = "current_date"
++                index += 1
++                continue
++
++            if section == "claude_md":
++                if not stripped:
++                    index += 1
++                    continue
++                if stripped.startswith("Contents of "):
++                    index += 1
++                    continue
++                if stripped.startswith("Codebase and user instructions are shown below."):
++                    context_lines.append(
++                        "Apply repository and user instructions from Claude project context when directly relevant."
++                    )
++                    index += 1
++                    continue
++                if "context may or may not be relevant to your tasks" in stripped.lower():
++                    index += 1
++                    continue
++                if stripped.startswith("- "):
++                    bullet = cls._clean_markdown_line(stripped[2:])
++                    if bullet:
++                        memory_bullets.append(f"- {bullet}")
++                    index += 1
++                    continue
++
++                cleaned = cls._clean_markdown_line(stripped)
++                if cleaned and "/" not in cleaned and len(cleaned) <= 200:
++                    context_lines.append(cleaned)
++                index += 1
++                continue
++
++            if section == "current_date":
++                if stripped.startswith("Today's date is "):
++                    current_date = stripped
++                index += 1
++                continue
++
++            index += 1
++
++        return index, context_lines, memory_bullets, current_date
++
++    @classmethod
++    def _compact_embedded_system_reminder(cls, text: str) -> Optional[str]:
++        lines = text.splitlines()
++        kept_lines: List[str] = []
++        saw_malware_policy = False
++        index = 0
++
++        while index < len(lines):
++            raw_line = lines[index].rstrip()
++            stripped = raw_line.strip()
++
++            if stripped in {"<system-reminder>", "</system-reminder>"}:
++                index += 1
++                continue
++            if cls._is_probably_volatile_reminder_line(raw_line):
++                index += 1
++                continue
++            if not stripped:
++                kept_lines.append("")
++                index += 1
++                continue
++            if stripped.startswith(
++                "Whenever you read a file, you should consider whether it would be considered malware."
++            ):
++                if not saw_malware_policy:
++                    kept_lines.append(raw_line)
++                    saw_malware_policy = True
++                index += 1
++                continue
++            if stripped.startswith("Called the ") and " tool with the following input:" in stripped:
++                index += 1
++                continue
++            if stripped.startswith("Result of calling the "):
++                index += 1
++                while index < len(lines):
++                    next_line = lines[index].rstrip()
++                    next_stripped = next_line.strip()
++                    if next_stripped in {"<system-reminder>", "</system-reminder>"}:
++                        index += 1
++                        continue
++                    if not next_stripped or re.match(r"^\d+\t", next_line):
++                        index += 1
++                        continue
++                    break
++                continue
++            if stripped.startswith("Note: ") and "was read before the last conversation was summarized" in stripped:
++                index += 1
++                continue
++            if (
++                stripped.startswith("Task ")
++                and "(type: local_agent)" in stripped
++                and "Read the output file to retrieve the result:" in stripped
++            ):
++                index += 1
++                continue
++
++            kept_lines.append(raw_line)
++            index += 1
++
++        compacted_lines = cls._normalize_unordered_bullet_runs(kept_lines)
++        compacted_lines = cls._collapse_blank_lines(compacted_lines)
++
++        compacted = "\n".join(compacted_lines).strip()
++        return compacted or None
++
++    @classmethod
++    def _extract_system_reminder_text(cls, text: str) -> Optional[str]:
 +        """Lift Claude harness system reminders out of user content."""
 +        if not text:
 +            return None
@@ -97,8 +349,8 @@
 +        prefix = "<system-reminder>"
 +        if not stripped.startswith(prefix):
 +            return None
-+        remainder = stripped[len(prefix) :].lstrip("\n").strip()
-+        return remainder or None
++        remainder = stripped[len(prefix) :].lstrip("\n")
++        return cls._compact_embedded_system_reminder(remainder)
 +
 +    @staticmethod
 +    def _normalize_cache_identifier(value: str) -> str:
@@ -106,6 +358,106 @@
 +        if len(value) <= 128:
 +            return value
 +        return hashlib.sha256(value.encode("utf-8")).hexdigest()
++
++    @staticmethod
++    def _looks_like_uuid(value: str) -> bool:
++        try:
++            uuid.UUID(value.strip())
++        except ValueError:
++            return False
++        return True
++
++    @classmethod
++    def _is_probably_ephemeral_identifier(cls, value: str) -> bool:
++        normalized = value.strip()
++        if not normalized:
++            return False
++        lowered = normalized.lower()
++        if cls._looks_like_uuid(lowered):
++            return True
++        if lowered.startswith("user-") and len(lowered) >= 16:
++            return True
++        return False
++
++    @staticmethod
++    def _extract_workspace_marker(text: Optional[str]) -> Optional[str]:
++        if not text:
++            return None
++        for raw_line in text.splitlines():
++            line = raw_line.strip()
++            for prefix in ("cwd=", "workspace=", "project_root="):
++                if line.startswith(prefix):
++                    value = line[len(prefix) :].strip()
++                    if value:
++                        return value
++        return None
++
++    @classmethod
++    def _build_workspace_cache_identifier(
++        cls,
++        metadata: Optional[Dict[str, Any]],
++        system: Optional[Any],
++        embedded_system_reminders: Optional[List[str]],
++        tools: Optional[List[AllAnthropicToolsValues]],
++    ) -> Optional[str]:
++        workspace_marker: Optional[str] = None
++
++        if isinstance(metadata, dict):
++            for key in ("cwd", "workspace", "project_root"):
++                value = metadata.get(key)
++                if isinstance(value, str) and value.strip():
++                    workspace_marker = value.strip()
++                    break
++
++        if workspace_marker is None:
++            system_texts: List[str] = []
++            if isinstance(system, str):
++                sanitized = cls._sanitize_system_text(system)
++                if sanitized:
++                    system_texts.append(sanitized)
++            elif isinstance(system, list):
++                system_texts.extend(
++                    sanitized
++                    for block in system
++                    if isinstance(block, dict)
++                    and block.get("type") == "text"
++                    and (sanitized := cls._sanitize_system_text(block.get("text", "")))
++                )
++            if embedded_system_reminders:
++                system_texts.extend(embedded_system_reminders)
++
++            for text in system_texts:
++                workspace_marker = cls._extract_workspace_marker(text)
++                if workspace_marker is not None:
++                    break
++
++        if workspace_marker is not None:
++            serialized = json.dumps(
++                {
++                    "workspace": workspace_marker,
++                },
++                ensure_ascii=False,
++                separators=(",", ":"),
++                sort_keys=True,
++            )
++            return "claude-code:" + hashlib.sha256(
++                serialized.encode("utf-8")
++            ).hexdigest()
++
++        tool_fingerprint = cls._fingerprint_tool_payload(tools)
++        if tool_fingerprint is None:
++            return None
++        serialized = json.dumps(
++            {
++                "tools": tool_fingerprint,
++            },
++            ensure_ascii=False,
++            separators=(",", ":"),
++            sort_keys=True,
++        )
++        return "claude-code:" + hashlib.sha256(
++            serialized.encode("utf-8")
++        ).hexdigest()
 +
 +    @staticmethod
 +    def _normalize_call_identifier(index: int) -> str:
@@ -189,14 +541,24 @@
 +
 +    @classmethod
 +    def _get_stable_cache_identifier(
-+        cls, metadata: Optional[Dict[str, Any]]
++        cls,
++        metadata: Optional[Dict[str, Any]],
++        system: Optional[Any] = None,
++        embedded_system_reminders: Optional[List[str]] = None,
++        tools: Optional[List[AllAnthropicToolsValues]] = None,
 +    ) -> Optional[str]:
++        workspace_identifier = cls._build_workspace_cache_identifier(
++            metadata=metadata if isinstance(metadata, dict) else None,
++            system=system,
++            embedded_system_reminders=embedded_system_reminders,
++            tools=tools,
++        )
 +        if not isinstance(metadata, dict):
-+            return None
++            return workspace_identifier
 +
 +        user_id = metadata.get("user_id")
 +        if user_id is None:
-+            return None
++            return workspace_identifier
 +
 +        parsed_user_id: Optional[Dict[str, Any]] = None
 +        raw_user_id: Optional[str] = None
@@ -222,7 +584,12 @@
 +            stable_bits = {
 +                key: value
 +                for key, value in parsed_user_id.items()
-+                if key != "session_id" and value not in (None, "")
++                if key != "session_id"
++                and value not in (None, "")
++                and not (
++                    isinstance(value, str)
++                    and cls._is_probably_ephemeral_identifier(value)
++                )
 +            }
 +            if stable_bits:
 +                return cls._normalize_cache_identifier(
@@ -230,10 +597,15 @@
 +                )
 +
 +        if isinstance(raw_user_id, str) and raw_user_id.strip():
++            if (
++                workspace_identifier is not None
++                and cls._is_probably_ephemeral_identifier(raw_user_id)
++            ):
++                return workspace_identifier
 +            return cls._normalize_cache_identifier(raw_user_id)
 +
-         return None
- 
++        return workspace_identifier
++
 +    @classmethod
 +    def _lift_embedded_system_reminders(
 +        cls,
@@ -302,7 +674,7 @@
      def translate_messages_to_responses_input(  # noqa: PLR0915
          self,
          messages: List[
-@@ -71,6 +294,7 @@
+@@ -71,6 +668,7 @@
            assistant tool_use -> function_call
          """
          input_items: List[Dict[str, Any]] = []
@@ -310,7 +682,7 @@
  
          for m in messages:
              role = m["role"]
-@@ -104,7 +328,9 @@
+@@ -104,7 +702,9 @@
                                      {"type": "input_image", "image_url": url}
                                  )
                          elif btype == "tool_result":
@@ -321,7 +693,7 @@
                              inner = block.get("content")
                              if inner is None:
                                  output_text = ""
-@@ -160,17 +386,15 @@
+@@ -160,17 +760,15 @@
                              input_items.append(
                                  {
                                      "type": "function_call",
@@ -343,7 +715,7 @@
                      if asst_parts:
                          input_items.append(
                              {
-@@ -297,6 +521,9 @@
+@@ -297,6 +895,9 @@
              ],
              anthropic_request["messages"],
          )
@@ -353,7 +725,7 @@
  
          responses_kwargs: Dict[str, Any] = {
              "model": model,
-@@ -305,16 +532,29 @@
+@@ -305,16 +906,29 @@
  
          # system -> instructions
          system = anthropic_request.get("system")
@@ -387,7 +759,7 @@
  
          # max_tokens -> max_output_tokens
          max_tokens = anthropic_request.get("max_tokens")
-@@ -345,10 +585,21 @@
+@@ -345,10 +959,21 @@
  
          # thinking -> reasoning
          thinking = anthropic_request.get("thinking")
@@ -409,7 +781,7 @@
  
          # output_format / output_config.format -> text format
          # output_format: {"type": "json_schema", "schema": {...}}
-@@ -381,10 +632,13 @@
+@@ -381,10 +1006,16 @@
              if openai_cm is not None:
                  responses_kwargs["context_management"] = openai_cm
  
@@ -419,14 +791,17 @@
 -        if isinstance(metadata, dict) and "user_id" in metadata:
 -            responses_kwargs["user"] = str(metadata["user_id"])[:64]
 +        stable_identifier = self._get_stable_cache_identifier(
-+            cast(Optional[Dict[str, Any]], metadata)
++            cast(Optional[Dict[str, Any]], metadata),
++            system=system,
++            embedded_system_reminders=embedded_system_reminders,
++            tools=cast(Optional[List[AllAnthropicToolsValues]], tools),
 +        )
 +        if stable_identifier:
 +            responses_kwargs["prompt_cache_key"] = stable_identifier
  
          return responses_kwargs
  
-@@ -480,11 +734,30 @@
+@@ -480,11 +1111,30 @@
          raw_usage: Optional[ResponseAPIUsage] = response.usage
          input_tokens = int(getattr(raw_usage, "input_tokens", 0) or 0)
          output_tokens = int(getattr(raw_usage, "output_tokens", 0) or 0)
@@ -457,7 +832,7 @@
  
          return AnthropicMessagesResponse(
              id=response.id,
-@@ -496,3 +769,8 @@
+@@ -496,3 +1146,8 @@
              content=content,  # type: ignore
              stop_reason=stop_reason,
          )
